@@ -187,8 +187,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     position: absolute; top: 0; left: 0; right: 0;
     padding: 14px; padding-top: max(14px, env(safe-area-inset-top));
     display: flex; justify-content: space-between; align-items: center;
-    background: linear-gradient(rgba(0,0,0,.6), transparent);
+    background: linear-gradient(rgba(0,0,0,.55), transparent);
     font-size: 14px;
+    transition: opacity .2s ease;
   }}
   #lb .close {{
     background: rgba(255,255,255,.15); border: none; color: #fff;
@@ -203,11 +204,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   #lb .pos {{ color: #ddd; }}
   #lb .toolbar {{
     position: absolute; left: 0; right: 0; bottom: 0;
-    padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom));
+    padding: 16px 14px; padding-bottom: max(16px, env(safe-area-inset-bottom));
     display: none; align-items: center; justify-content: space-between;
-    background: linear-gradient(transparent, rgba(0,0,0,.7));
+    background: linear-gradient(transparent, rgba(0,0,0,.65));
+    transition: opacity .2s ease;
   }}
-  #lb .toolbar.show {{ display: flex; }}
+  /* 編集可能なアイテムのときだけツールバーを配置 */
+  #lb.editable .toolbar {{ display: flex; }}
+  /* 中央タップでコントロール(chrome)を半透明トグル。非表示時はフェードアウト */
+  #lb:not(.chrome) .bar,
+  #lb:not(.chrome) .toolbar {{ opacity: 0; pointer-events: none; }}
   #lb .stars {{ display: flex; gap: 4px; }}
   #lb .stars .st {{
     font-size: 30px; line-height: 1; color: #666;
@@ -277,6 +283,7 @@ function open(i) {{
   idx = i;
   show();
   lb.classList.add('open');
+  lb.classList.add('chrome'); // 開いた直後はコントロールを表示
   document.body.style.overflow = 'hidden';
 }}
 function close() {{
@@ -292,11 +299,13 @@ function show() {{
   // 編集ツールバー（Eagleアイテム かつ --allow-edit のときのみ）
   if (EDIT && it.id) {{
     renderStars(it.star || 0);
-    lbtools.classList.add('show');
+    lb.classList.add('editable');
   }} else {{
-    lbtools.classList.remove('show');
+    lb.classList.remove('editable');
   }}
 }}
+// 画像中央のタップでコントロール表示/非表示をトグル
+function toggleChrome() {{ lb.classList.toggle('chrome'); }}
 function next() {{ if (idx < IMAGES.length - 1) {{ idx++; show(); }} }}
 function prev() {{ if (idx > 0) {{ idx--; show(); }} }}
 
@@ -364,6 +373,10 @@ document.getElementById('lbclose').addEventListener('click', close);
 document.getElementById('lbnext').addEventListener('click', next);
 document.getElementById('lbprev').addEventListener('click', prev);
 lbtrash.addEventListener('click', trash);
+// 画像（中央）のタップでコントロールを表示/非表示（スワイプ時は無視）
+document.querySelector('#lb .stage').addEventListener('click', () => {{
+  if (!moved) toggleChrome();
+}});
 
 // キーボード操作（PC でも使えるように）
 document.addEventListener('keydown', (e) => {{
