@@ -361,14 +361,24 @@ class Handler(BaseHTTPRequestHandler):
     # Eagle 連携
     # ----------------------------------------------------------------- #
     def serve_eagle_home(self):
-        """スマートフォルダの一覧を表示する。"""
+        """組み込みビュー（すべて/未分類）とスマートフォルダの一覧を表示する。"""
         try:
             folders = eagle.get_smart_folders(EAGLE_API)
         except eagle.EagleError as e:
             return self.send_eagle_error(e)
 
-        crumbs_html = "🦅 Eagle スマートフォルダ"
+        crumbs_html = "🦅 Eagle"
         items_html = []
+        # 組み込みの特別ビュー
+        for vid, icon, label in (
+            ("__all__", "🗂️", "すべて"),
+            ("__uncategorized__", "📭", "未分類"),
+        ):
+            href = "/eagle/smart?id=" + vid
+            items_html.append(
+                f'<a class="folder" href="{href}">'
+                f'<span class="ico">{icon}</span>{label}</a>'
+            )
         for f in folders:
             href = "/eagle/smart?id=" + urllib.parse.quote(f["id"])
             badge = (
@@ -380,15 +390,9 @@ class Handler(BaseHTTPRequestHandler):
                 f'<a class="folder" href="{href}">'
                 f'<span class="ico">🔍</span>{html.escape(f["name"])}{badge}</a>'
             )
-        if items_html:
-            folders_html = f'<div class="folders">{"".join(items_html)}</div>'
-            extra = ""
-        else:
-            folders_html = ""
-            extra = '<div class="empty">スマートフォルダがありません</div>'
-        count = f"スマートフォルダ {len(folders)} 件"
-        self.render_page("Eagle スマートフォルダ", crumbs_html, count,
-                         folders_html, [], extra_grid=extra)
+        folders_html = f'<div class="folders">{"".join(items_html)}</div>'
+        count = f"スマートフォルダ {len(folders)} 件 ＋ すべて / 未分類"
+        self.render_page("Eagle", crumbs_html, count, folders_html, [])
 
     def serve_eagle_smart(self, sid: str):
         """指定スマートフォルダの中身（条件に合致する画像）を表示する。"""
@@ -396,13 +400,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
             return
         try:
-            folders = eagle.get_smart_folders(EAGLE_API)
-            target = next((f for f in folders if f["id"] == sid), None)
-            if target is None:
-                self.send_error(404, "Smart folder not found")
-                return
             items = eagle.get_all_items(EAGLE_API)
-            matched = eagle.filter_items(target["conditions"], items)
+            if sid == "__all__":
+                target = {"name": "すべて", "partial": False}
+                matched = items
+            elif sid == "__uncategorized__":
+                target = {"name": "未分類", "partial": False}
+                matched = [it for it in items if not it.get("folders")]
+            else:
+                folders = eagle.get_smart_folders(EAGLE_API)
+                target = next((f for f in folders if f["id"] == sid), None)
+                if target is None:
+                    self.send_error(404, "Smart folder not found")
+                    return
+                matched = eagle.filter_items(target["conditions"], items)
         except eagle.EagleError as e:
             return self.send_eagle_error(e)
 
@@ -422,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         crumbs = (
-            '<a href="/">🦅 スマートフォルダ</a>'
+            '<a href="/">🦅 Eagle</a>'
             ' <span style="color:#555">/</span> '
             f'{html.escape(target["name"])}'
         )
