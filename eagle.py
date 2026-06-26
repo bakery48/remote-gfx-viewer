@@ -107,6 +107,40 @@ def get_thumbnail_path(item_id: str, api_base: str = DEFAULT_API) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# 書き込み系（--allow-edit のときのみ server から呼ばれる）
+# --------------------------------------------------------------------------- #
+def _post(api_base: str, path: str, body: dict, timeout: float = 8.0):
+    url = api_base.rstrip("/") + path
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise EagleError(
+            f"Eagle API へ接続できません ({url})。Eagle アプリが起動しているか確認してください。 [{e}]"
+        )
+    except (ValueError, OSError) as e:
+        raise EagleError(f"Eagle API の応答を解釈できません ({url}): {e}")
+    if isinstance(payload, dict) and payload.get("status") not in (None, "success"):
+        raise EagleError(f"Eagle API がエラーを返しました ({url}): {payload}")
+    return payload.get("data") if isinstance(payload, dict) else payload
+
+
+def set_star(item_id: str, star: int, api_base: str = DEFAULT_API):
+    """アイテムの★評価を変更する（0〜5）。お気に入り=★5 として使う。"""
+    star = max(0, min(5, int(star)))
+    return _post(api_base, "/api/item/update", {"id": item_id, "star": star})
+
+
+def move_to_trash(item_id: str, api_base: str = DEFAULT_API):
+    """アイテムを Eagle のゴミ箱へ移動する（復元可能）。"""
+    return _post(api_base, "/api/item/moveToTrash", {"itemIds": [item_id]})
+
+
+# --------------------------------------------------------------------------- #
 # スマートフォルダ条件の評価（方式A）
 # --------------------------------------------------------------------------- #
 def _has_unsupported(conditions) -> bool:

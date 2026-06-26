@@ -61,6 +61,7 @@ ROOT_DIR = os.getcwd()
 THUMB_SIZE = 400  # サムネイルの最大辺(px)
 EAGLE_MODE = False  # Eagle 連携を有効にするか
 EAGLE_API = eagle.DEFAULT_API  # Eagle ローカル API のベースURL
+EDIT_ENABLED = False  # スマホからの編集（★/削除）を許可するか
 
 
 def is_image(name: str) -> bool:
@@ -200,6 +201,31 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   #lb .nav.prev {{ left: 0; justify-content: flex-start; }}
   #lb .nav.next {{ right: 0; justify-content: flex-end; }}
   #lb .pos {{ color: #ddd; }}
+  #lb .toolbar {{
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom));
+    display: none; align-items: center; justify-content: space-between;
+    background: linear-gradient(transparent, rgba(0,0,0,.7));
+  }}
+  #lb .toolbar.show {{ display: flex; }}
+  #lb .stars {{ display: flex; gap: 4px; }}
+  #lb .stars .st {{
+    font-size: 30px; line-height: 1; color: #666;
+    padding: 4px; cursor: pointer; user-select: none;
+  }}
+  #lb .stars .st.on {{ color: #ffce3d; }}
+  #lb .trash {{
+    background: rgba(220,60,60,.85); border: none; color: #fff;
+    padding: 10px 16px; border-radius: 10px; font-size: 15px;
+  }}
+  #lb .trash:active {{ background: rgba(180,40,40,.9); }}
+  .toast {{
+    position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%);
+    background: rgba(40,40,40,.95); color: #fff; padding: 10px 16px;
+    border-radius: 8px; font-size: 14px; z-index: 200; opacity: 0;
+    transition: opacity .2s; pointer-events: none;
+  }}
+  .toast.show {{ opacity: 1; }}
 </style>
 </head>
 <body>
@@ -220,14 +246,32 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="nav prev" id="lbprev"></div>
   <div class="nav next" id="lbnext"></div>
+  <div class="toolbar" id="lbtools">
+    <div class="stars" id="lbstars"></div>
+    <button class="trash" id="lbtrash">🗑 削除</button>
+  </div>
 </div>
+<div class="toast" id="toast"></div>
 
 <script>
 const IMAGES = {images_json};
+const EDIT = {edit_js};
 let idx = -1;
 const lb = document.getElementById('lb');
 const lbimg = document.getElementById('lbimg');
 const lbpos = document.getElementById('lbpos');
+const lbtools = document.getElementById('lbtools');
+const lbstars = document.getElementById('lbstars');
+const lbtrash = document.getElementById('lbtrash');
+const toastEl = document.getElementById('toast');
+let toastTimer = null;
+
+function toast(msg) {{
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+}}
 
 function open(i) {{
   idx = i;
@@ -242,18 +286,84 @@ function close() {{
 }}
 function show() {{
   if (idx < 0 || idx >= IMAGES.length) return;
-  lbimg.src = IMAGES[idx].full;
-  lbpos.textContent = (idx + 1) + ' / ' + IMAGES.length + '  ' + IMAGES[idx].name;
+  const it = IMAGES[idx];
+  lbimg.src = it.full;
+  lbpos.textContent = (idx + 1) + ' / ' + IMAGES.length + '  ' + it.name;
+  // 編集ツールバー（Eagleアイテム かつ --allow-edit のときのみ）
+  if (EDIT && it.id) {{
+    renderStars(it.star || 0);
+    lbtools.classList.add('show');
+  }} else {{
+    lbtools.classList.remove('show');
+  }}
 }}
 function next() {{ if (idx < IMAGES.length - 1) {{ idx++; show(); }} }}
 function prev() {{ if (idx > 0) {{ idx--; show(); }} }}
 
-document.querySelectorAll('.cell').forEach((c, i) => {{
-  c.addEventListener('click', () => open(i));
+function renderStars(star) {{
+  lbstars.innerHTML = '';
+  for (let n = 1; n <= 5; n++) {{
+    const s = document.createElement('span');
+    s.className = 'st' + (n <= star ? ' on' : '');
+    s.textContent = '★';
+    s.addEventListener('click', () => setStar(n));
+    lbstars.appendChild(s);
+  }}
+}}
+
+async function setStar(n) {{
+  const it = IMAGES[idx];
+  // 同じ★を再タップで解除（0に）
+  const value = (it.star === n) ? 0 : n;
+  try {{
+    const r = await fetch('/eagle/star', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{id: it.id, star: value}})
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    it.star = value;
+    renderStars(value);
+    toast(value === 5 ? '⭐ お気に入りに登録' : (value === 0 ? '評価を解除' : '★' + value + ' に変更'));
+  }} catch (e) {{
+    toast('変更に失敗: ' + e.message);
+  }}
+}}
+
+async function trash() {{
+  const it = IMAGES[idx];
+  if (!confirm('「' + it.name + '」をEagleのゴミ箱へ移動しますか？')) return;
+  try {{
+    const r = await fetch('/eagle/trash', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{id: it.id}})
+    }});
+    if (!r.ok) throw new Error(await r.text());
+    IMAGES.splice(idx, 1);
+    // 対応するサムネイルセルも消す
+    const cell = document.querySelectorAll('.cell')[idx];
+    if (cell) cell.remove();
+    toast('🗑 ゴミ箱へ移動しました');
+    if (IMAGES.length === 0) {{ close(); return; }}
+    if (idx >= IMAGES.length) idx = IMAGES.length - 1;
+    show();
+  }} catch (e) {{
+    toast('削除に失敗: ' + e.message);
+  }}
+}}
+
+document.querySelectorAll('.cell').forEach((c) => {{
+  // 削除でセルが減ってもズレないよう、クリック時に現在位置を求める
+  c.addEventListener('click', () => {{
+    const i = Array.from(document.querySelectorAll('.cell')).indexOf(c);
+    if (i >= 0) open(i);
+  }});
 }});
 document.getElementById('lbclose').addEventListener('click', close);
 document.getElementById('lbnext').addEventListener('click', next);
 document.getElementById('lbprev').addEventListener('click', prev);
+lbtrash.addEventListener('click', trash);
 
 // キーボード操作（PC でも使えるように）
 document.addEventListener('keydown', (e) => {{
@@ -319,6 +429,53 @@ class Handler(BaseHTTPRequestHandler):
         # それ以外はギャラリーページ（path がフォルダの相対パス）
         return self.serve_gallery(path)
 
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path not in ("/eagle/star", "/eagle/trash"):
+            self.send_error(404, "Not Found")
+            return
+        if not (EAGLE_MODE and EDIT_ENABLED):
+            return self._json_error(403, "編集は無効です（--allow-edit で起動してください）")
+        body = self._read_json()
+        if body is None:
+            return self._json_error(400, "不正なリクエストです")
+        item_id = body.get("id")
+        if not item_id:
+            return self._json_error(400, "id がありません")
+        try:
+            if path == "/eagle/star":
+                eagle.set_star(item_id, int(body.get("star", 0)), EAGLE_API)
+            else:  # /eagle/trash
+                eagle.move_to_trash(item_id, EAGLE_API)
+        except (eagle.EagleError, ValueError) as e:
+            return self._json_error(502, str(e))
+        self._json_ok()
+
+    # ----------------------------------------------------------------- #
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b""
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, OSError):
+            return None
+
+    def _json_ok(self):
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_error(self, code, msg):
+        body = json.dumps({"error": msg}, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ----------------------------------------------------------------- #
     def render_page(self, title, crumbs_html, count, folders_html, img_data,
                     extra_grid=""):
@@ -337,11 +494,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             grid_html = extra_grid
 
-        # IMAGES 用には name/full のみ渡す
-        images_json = json.dumps(
-            [{"name": d["name"], "full": d["full"]} for d in img_data],
-            ensure_ascii=False,
-        )
+        # IMAGES 用には name/full と（Eagleなら）id/star を渡す
+        images_payload = []
+        for d in img_data:
+            entry = {"name": d["name"], "full": d["full"]}
+            if "id" in d:
+                entry["id"] = d["id"]
+                entry["star"] = d.get("star", 0)
+            images_payload.append(entry)
+        images_json = json.dumps(images_payload, ensure_ascii=False)
+        edit_js = "true" if (EDIT_ENABLED and EAGLE_MODE) else "false"
         page = PAGE_TEMPLATE.format(
             title=html.escape(title),
             crumbs=crumbs_html,
@@ -349,6 +511,7 @@ class Handler(BaseHTTPRequestHandler):
             folders_html=folders_html,
             grid_html=grid_html,
             images_json=images_json,
+            edit_js=edit_js,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -422,13 +585,16 @@ class Handler(BaseHTTPRequestHandler):
 
         img_data = []
         for it in matched:
-            iid = urllib.parse.quote(it.get("id", ""))
+            raw_id = it.get("id", "")
+            iid = urllib.parse.quote(raw_id)
             name = it.get("name", "") + "." + (it.get("ext") or "")
             img_data.append(
                 {
                     "name": name,
                     "thumb": f"/eagle/thumb?id={iid}",
                     "full": f"/eagle/raw?id={iid}",
+                    "id": raw_id,
+                    "star": it.get("star", 0) or 0,
                 }
             )
 
@@ -638,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ROOT_DIR, THUMB_SIZE, EAGLE_MODE, EAGLE_API
+    global ROOT_DIR, THUMB_SIZE, EAGLE_MODE, EAGLE_API, EDIT_ENABLED
 
     parser = argparse.ArgumentParser(
         description="同じLAN上のスマホからローカル画像を閲覧する軽量サーバー"
@@ -673,10 +839,16 @@ def main():
         default=eagle.DEFAULT_API,
         help=f"Eagle ローカル API のURL（既定: {eagle.DEFAULT_API}）",
     )
+    parser.add_argument(
+        "--allow-edit",
+        action="store_true",
+        help="スマホからの★評価変更・削除（ゴミ箱へ）を許可する（--eagle 時のみ）",
+    )
     args = parser.parse_args()
 
     EAGLE_MODE = args.eagle
     EAGLE_API = args.eagle_api
+    EDIT_ENABLED = args.allow_edit
     THUMB_SIZE = args.thumb_size
 
     # ディレクトリ: 指定があれば検証。--eagle 単独なら省略可。
@@ -707,6 +879,8 @@ def main():
     print("=" * 56)
     if EAGLE_MODE:
         print(f"  モード       : Eagle 連携（{EAGLE_API}）")
+        edit_label = "有効（★変更・削除可）" if EDIT_ENABLED else "無効（閲覧専用）"
+        print(f"  編集         : {edit_label}")
     if root:
         print(f"  公開フォルダ : {root}")
     print(f"  サムネイル   : {'Pillowで生成' if HAS_PIL else '元画像を縮小表示 (Pillow未導入)'}")
