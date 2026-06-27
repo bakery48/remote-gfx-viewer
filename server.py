@@ -23,6 +23,7 @@ PCのIPアドレスは起動時にコンソールへ表示されます。
 from __future__ import annotations
 
 import argparse
+import base64
 import hmac
 import html
 import io
@@ -32,11 +33,13 @@ import os
 import secrets
 import socket
 import sys
+import tempfile
 import urllib.parse
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import eagle
+import sd
 
 # Pillow は任意。あればサムネイル生成に使う。
 try:
@@ -69,6 +72,8 @@ PASSWORD = None  # ログインパスワード（None なら認証なし）
 AUTH_ENABLED = False  # 認証を有効にするか
 SESSIONS = set()  # 有効なセッショントークン（メモリ保持）
 SESSION_MAX_AGE = 60 * 60 * 24 * 30  # クッキー有効期間（30日）
+SD_MODE = False  # Stable Diffusion 連携（生成）を有効にするか
+SD_API = sd.DEFAULT_API  # SD webui の API ベースURL
 
 
 def is_image(name: str) -> bool:
@@ -149,11 +154,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .crumbs a {{ color: #7cc4ff; text-decoration: none; }}
   .crumbs a:active {{ opacity: .6; }}
   .count {{ color: #888; font-size: 12px; margin-top: 4px; }}
-  .logout {{
+  .hlinks {{
     position: absolute; top: max(12px, env(safe-area-inset-top)); right: 14px;
-    color: #888; font-size: 12px; text-decoration: none;
+    display: flex; gap: 14px;
   }}
-  .logout:active {{ color: #ccc; }}
+  .hlinks a {{ color: #9ad; font-size: 13px; text-decoration: none; }}
+  .hlinks a:active {{ color: #cce; }}
   main {{ padding: 10px; }}
   .folders {{ display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }}
   .folder {{
@@ -250,7 +256,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div class="crumbs">{crumbs}</div>
   <div class="count">{count}</div>
-  {logout_link}
+  <div class="hlinks">{header_links}</div>
 </header>
 <main>
   {folders_html}
@@ -466,6 +472,163 @@ LOGIN_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+GENERATE_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>画像生成</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; background: #121212; color: #e8e8e8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  header {{
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(20,20,20,.95); backdrop-filter: blur(8px);
+    padding: 12px 14px; padding-top: max(12px, env(safe-area-inset-top));
+    border-bottom: 1px solid #2a2a2a; display: flex;
+    justify-content: space-between; align-items: center;
+  }}
+  header a {{ color: #7cc4ff; text-decoration: none; font-size: 14px; }}
+  header .title {{ font-size: 16px; font-weight: 600; }}
+  main {{ padding: 12px; max-width: 720px; margin: 0 auto; }}
+  label {{ display: block; font-size: 13px; color: #aaa; margin: 12px 0 4px; }}
+  textarea, input, select {{
+    width: 100%; font-size: 16px; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid #3a3a3a; background: #1a1a1a; color: #e8e8e8;
+  }}
+  textarea {{ resize: vertical; min-height: 70px; }}
+  .row {{ display: flex; gap: 10px; }}
+  .row > div {{ flex: 1; }}
+  details {{ margin-top: 10px; background: #1a1a1a; border-radius: 10px; padding: 0 12px; }}
+  summary {{ padding: 12px 0; cursor: pointer; color: #ccc; }}
+  .gen {{
+    width: 100%; margin-top: 16px; padding: 15px; border: none; border-radius: 12px;
+    background: #2d7dd2; color: #fff; font-size: 17px; font-weight: 600;
+  }}
+  .gen:disabled {{ background: #444; }}
+  .check {{ display: flex; align-items: center; gap: 8px; margin-top: 14px; }}
+  .check input {{ width: auto; }}
+  #status {{ margin-top: 14px; font-size: 14px; color: #9ad; min-height: 20px; }}
+  .barwrap {{ height: 6px; background: #222; border-radius: 3px; overflow: hidden; margin-top: 8px; display: none; }}
+  .barwrap.show {{ display: block; }}
+  #bar {{ height: 100%; width: 0%; background: #2d7dd2; transition: width .3s; }}
+  .results {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 16px; }}
+  .results img {{ width: 100%; border-radius: 8px; display: block; }}
+  .hint {{ color: #777; font-size: 12px; }}
+</style>
+</head>
+<body>
+<header>
+  <span class="title">✨ 画像生成 (SDXL)</span>
+  <span>{header_links}</span>
+</header>
+<main>
+  <label>プロンプト</label>
+  <textarea id="prompt" placeholder="例: a cat astronaut, highly detailed, cinematic lighting"></textarea>
+
+  <label>ネガティブプロンプト</label>
+  <textarea id="negative" placeholder="例: lowres, bad anatomy, worst quality"></textarea>
+
+  <div class="row">
+    <div><label>幅</label><input id="width" type="number" value="1024" min="64" max="2048" step="64"></div>
+    <div><label>高さ</label><input id="height" type="number" value="1024" min="64" max="2048" step="64"></div>
+    <div><label>枚数</label><input id="count" type="number" value="1" min="1" max="8"></div>
+  </div>
+
+  <details>
+    <summary>詳細設定（steps / CFG / seed / サンプラー）</summary>
+    <div class="row">
+      <div><label>Steps</label><input id="steps" type="number" value="30" min="1" max="150"></div>
+      <div><label>CFG</label><input id="cfg" type="number" value="7" min="1" max="30" step="0.5"></div>
+    </div>
+    <label>Seed（-1 でランダム）</label>
+    <input id="seed" type="number" value="-1">
+    <label>サンプラー</label>
+    <select id="sampler">{sampler_options}</select>
+    <div style="height:12px"></div>
+  </details>
+
+  {eagle_save_html}
+
+  <button class="gen" id="genbtn">生成する</button>
+  <div id="status"></div>
+  <div class="barwrap" id="barwrap"><div id="bar"></div></div>
+  <div class="results" id="results"></div>
+</main>
+
+<script>
+const EAGLE = {eagle_js};
+const btn = document.getElementById('genbtn');
+const statusEl = document.getElementById('status');
+const barwrap = document.getElementById('barwrap');
+const bar = document.getElementById('bar');
+const results = document.getElementById('results');
+let polling = null;
+
+function val(id) {{ return document.getElementById(id).value; }}
+
+async function poll() {{
+  try {{
+    const r = await fetch('/sd/progress');
+    if (!r.ok) return;
+    const d = await r.json();
+    const pct = Math.round((d.progress || 0) * 100);
+    bar.style.width = pct + '%';
+    if (pct > 0) statusEl.textContent = '生成中... ' + pct + '%';
+  }} catch (e) {{}}
+}}
+
+async function generate() {{
+  const save = EAGLE && document.getElementById('saveEagle') && document.getElementById('saveEagle').checked;
+  const body = {{
+    prompt: val('prompt'),
+    negative_prompt: val('negative'),
+    width: +val('width'), height: +val('height'),
+    n_iter: +val('count'),
+    steps: +val('steps'), cfg_scale: +val('cfg'),
+    seed: +val('seed'), sampler_name: val('sampler'),
+    save_to_eagle: !!save
+  }};
+  btn.disabled = true;
+  results.innerHTML = '';
+  statusEl.textContent = '生成を開始しました...';
+  barwrap.classList.add('show'); bar.style.width = '0%';
+  polling = setInterval(poll, 1000);
+  try {{
+    const r = await fetch('/generate/run', {{
+      method: 'POST', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(body)
+    }});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    (d.images || []).forEach(src => {{
+      const img = document.createElement('img');
+      img.src = src; img.loading = 'lazy';
+      results.appendChild(img);
+    }});
+    let msg = (d.images || []).length + ' 枚を生成しました';
+    if (d.saved) msg += ' / Eagleに ' + d.saved + ' 枚保存';
+    statusEl.textContent = msg;
+  }} catch (e) {{
+    statusEl.textContent = 'エラー: ' + e.message;
+  }} finally {{
+    clearInterval(polling);
+    bar.style.width = '100%';
+    setTimeout(() => barwrap.classList.remove('show'), 600);
+    btn.disabled = false;
+  }}
+}}
+btn.addEventListener('click', generate);
+</script>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RemoteGfxViewer/1.0"
 
@@ -486,6 +649,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_logout()
             if not self.is_authed():
                 return self.redirect("/login")
+
+        # ---- Stable Diffusion 生成ルート ----
+        if SD_MODE and path == "/generate":
+            return self.serve_generate_page()
+        if SD_MODE and path == "/sd/progress":
+            return self._send_json(sd.get_progress(SD_API))
+        # ギャラリーが無く生成だけの構成なら / は生成画面へ
+        if SD_MODE and path == "/" and not EAGLE_MODE and ROOT_DIR is None:
+            return self.redirect("/generate")
 
         # ---- Eagle 連携ルート ----
         if path == "/eagle/thumb":
@@ -514,6 +686,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_login()
         if AUTH_ENABLED and not self.is_authed():
             return self._json_error(401, "認証が必要です")
+        if path == "/generate/run":
+            return self.handle_generate()
         if path not in ("/eagle/star", "/eagle/trash"):
             self.send_error(404, "Not Found")
             return
@@ -597,6 +771,102 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect("/login", cookie="session=; Path=/; Max-Age=0")
 
     # ----------------------------------------------------------------- #
+    # 共通ヘッダーのリンク
+    # ----------------------------------------------------------------- #
+    def header_links(self, on_generate=False):
+        links = []
+        if SD_MODE and not on_generate:
+            links.append('<a href="/generate">✨ 生成</a>')
+        if on_generate:
+            links.append('<a href="/">← 戻る</a>')
+        if AUTH_ENABLED:
+            links.append('<a href="/logout">ログアウト</a>')
+        return "".join(links)
+
+    # ----------------------------------------------------------------- #
+    # Stable Diffusion 生成
+    # ----------------------------------------------------------------- #
+    def serve_generate_page(self):
+        samplers = sd.get_samplers(SD_API)
+        opts = "".join(
+            f'<option value="{html.escape(s)}">{html.escape(s)}</option>'
+            for s in samplers
+        )
+        if EAGLE_MODE:
+            eagle_save = (
+                '<label class="check"><input type="checkbox" id="saveEagle" checked>'
+                "生成結果を Eagle に保存する</label>"
+            )
+        else:
+            eagle_save = '<p class="hint">Eagle 連携(--eagle)時は結果をライブラリへ保存できます。</p>'
+        page = GENERATE_TEMPLATE.format(
+            sampler_options=opts,
+            eagle_save_html=eagle_save,
+            eagle_js=("true" if EAGLE_MODE else "false"),
+            header_links=self.header_links(on_generate=True),
+        )
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_generate(self):
+        if not SD_MODE:
+            return self._json_error(403, "生成は無効です（--sd で起動してください）")
+        params = self._read_json()
+        if params is None:
+            return self._json_error(400, "不正なリクエストです")
+        if not str(params.get("prompt", "")).strip():
+            return self._json_error(400, "プロンプトを入力してください")
+        try:
+            result = sd.txt2img(params, SD_API)
+        except sd.SDError as e:
+            return self._json_error(502, str(e))
+
+        b64_list = result["images"]
+        data_urls = [
+            "data:image/png;base64," + b for b in b64_list if isinstance(b, str)
+        ]
+
+        saved = 0
+        if params.get("save_to_eagle") and EAGLE_MODE:
+            saved = self._save_to_eagle(b64_list, params, result.get("info", {}))
+
+        self._send_json({"images": data_urls, "saved": saved})
+
+    def _save_to_eagle(self, b64_list, params, info):
+        """生成画像を一時ファイルに書き出し、Eagle へ取り込む。保存できた枚数を返す。"""
+        outdir = os.path.join(tempfile.gettempdir(), "rgv-generated")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError:
+            return 0
+        prompt = str(params.get("prompt", "")).strip()
+        base_name = (prompt[:40] or "sdxl").replace("\n", " ")
+        annotation = prompt
+        seed = info.get("seed", params.get("seed"))
+        saved = 0
+        for i, b in enumerate(b64_list):
+            try:
+                raw = base64.b64decode(b)
+            except (ValueError, TypeError):
+                continue
+            token = secrets.token_hex(4)
+            fpath = os.path.join(outdir, f"sdxl_{token}_{i}.png")
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(raw)
+                name = f"{base_name} ({seed})" if seed is not None else base_name
+                eagle.add_from_path(fpath, name, annotation=annotation,
+                                    tags=["SDXL"], api_base=EAGLE_API)
+                saved += 1
+            except (OSError, eagle.EagleError):
+                continue
+        return saved
+
+    # ----------------------------------------------------------------- #
     def _read_json(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -609,6 +879,14 @@ class Handler(BaseHTTPRequestHandler):
         body = b'{"status":"ok"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, data):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -649,7 +927,6 @@ class Handler(BaseHTTPRequestHandler):
             images_payload.append(entry)
         images_json = json.dumps(images_payload, ensure_ascii=False)
         edit_js = "true" if (EDIT_ENABLED and EAGLE_MODE) else "false"
-        logout_link = '<a class="logout" href="/logout">ログアウト</a>' if AUTH_ENABLED else ""
         page = PAGE_TEMPLATE.format(
             title=html.escape(title),
             crumbs=crumbs_html,
@@ -658,7 +935,7 @@ class Handler(BaseHTTPRequestHandler):
             grid_html=grid_html,
             images_json=images_json,
             edit_js=edit_js,
-            logout_link=logout_link,
+            header_links=self.header_links(),
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -952,7 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global ROOT_DIR, THUMB_SIZE, EAGLE_MODE, EAGLE_API, EDIT_ENABLED
-    global PASSWORD, AUTH_ENABLED
+    global PASSWORD, AUTH_ENABLED, SD_MODE, SD_API
 
     parser = argparse.ArgumentParser(
         description="同じLAN上のスマホからローカル画像を閲覧する軽量サーバー"
@@ -997,6 +1274,16 @@ def main():
         default=os.environ.get("RGV_PASSWORD"),
         help="ログインパスワード（指定すると認証必須。環境変数 RGV_PASSWORD でも可）",
     )
+    parser.add_argument(
+        "--sd",
+        action="store_true",
+        help="Stable Diffusion 連携。スマホから txt2img 生成ができる（webui を --api で起動）",
+    )
+    parser.add_argument(
+        "--sd-api",
+        default=sd.DEFAULT_API,
+        help=f"SD webui の API URL（既定: {sd.DEFAULT_API}）",
+    )
     args = parser.parse_args()
 
     EAGLE_MODE = args.eagle
@@ -1005,6 +1292,8 @@ def main():
     THUMB_SIZE = args.thumb_size
     PASSWORD = args.password if args.password else None
     AUTH_ENABLED = PASSWORD is not None
+    SD_MODE = args.sd
+    SD_API = args.sd_api
 
     # ディレクトリ: 指定があれば検証。--eagle 単独なら省略可。
     root = None
@@ -1013,7 +1302,7 @@ def main():
         if not os.path.isdir(root):
             print(f"エラー: フォルダが見つかりません: {root}", file=sys.stderr)
             sys.exit(1)
-    elif not EAGLE_MODE:
+    elif not EAGLE_MODE and not SD_MODE:
         root = os.path.abspath(".")  # 既定はカレントディレクトリ
     ROOT_DIR = root
 
@@ -1038,6 +1327,8 @@ def main():
         print(f"  編集         : {edit_label}")
     if root:
         print(f"  公開フォルダ : {root}")
+    if SD_MODE:
+        print(f"  画像生成     : 有効（SD API: {SD_API}）")
     print(f"  認証         : {'有効（パスワード）' if AUTH_ENABLED else '無効（誰でもアクセス可）'}")
     print(f"  サムネイル   : {'Pillowで生成' if HAS_PIL else '元画像を縮小表示 (Pillow未導入)'}")
     if EDIT_ENABLED and not AUTH_ENABLED:

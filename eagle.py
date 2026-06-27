@@ -140,6 +140,17 @@ def move_to_trash(item_id: str, api_base: str = DEFAULT_API):
     return _post(api_base, "/api/item/moveToTrash", {"itemIds": [item_id]})
 
 
+def add_from_path(path: str, name: str, annotation: str = "",
+                  tags: list | None = None, api_base: str = DEFAULT_API):
+    """ローカルのファイルパスから Eagle ライブラリへ画像を取り込む。"""
+    body = {"path": path, "name": name}
+    if annotation:
+        body["annotation"] = annotation
+    if tags:
+        body["tags"] = tags
+    return _post(api_base, "/api/item/addFromPath", body)
+
+
 # --------------------------------------------------------------------------- #
 # スマートフォルダ条件の評価（方式A）
 # --------------------------------------------------------------------------- #
