@@ -23,14 +23,17 @@ PCのIPアドレスは起動時にコンソールへ表示されます。
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
 import io
 import json
 import mimetypes
 import os
+import secrets
 import socket
 import sys
 import urllib.parse
+from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import eagle
@@ -62,6 +65,10 @@ THUMB_SIZE = 400  # サムネイルの最大辺(px)
 EAGLE_MODE = False  # Eagle 連携を有効にするか
 EAGLE_API = eagle.DEFAULT_API  # Eagle ローカル API のベースURL
 EDIT_ENABLED = False  # スマホからの編集（★/削除）を許可するか
+PASSWORD = None  # ログインパスワード（None なら認証なし）
+AUTH_ENABLED = False  # 認証を有効にするか
+SESSIONS = set()  # 有効なセッショントークン（メモリ保持）
+SESSION_MAX_AGE = 60 * 60 * 24 * 30  # クッキー有効期間（30日）
 
 
 def is_image(name: str) -> bool:
@@ -142,6 +149,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .crumbs a {{ color: #7cc4ff; text-decoration: none; }}
   .crumbs a:active {{ opacity: .6; }}
   .count {{ color: #888; font-size: 12px; margin-top: 4px; }}
+  .logout {{
+    position: absolute; top: max(12px, env(safe-area-inset-top)); right: 14px;
+    color: #888; font-size: 12px; text-decoration: none;
+  }}
+  .logout:active {{ color: #ccc; }}
   main {{ padding: 10px; }}
   .folders {{ display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }}
   .folder {{
@@ -238,6 +250,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <header>
   <div class="crumbs">{crumbs}</div>
   <div class="count">{count}</div>
+  {logout_link}
 </header>
 <main>
   {folders_html}
@@ -409,6 +422,50 @@ lb.addEventListener('touchend', (e) => {{
 """
 
 
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ログイン</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; background: #121212; color: #e8e8e8;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  form {{
+    width: min(90vw, 340px); background: #1e1e1e; padding: 28px 24px;
+    border-radius: 16px; display: flex; flex-direction: column; gap: 14px;
+  }}
+  h1 {{ font-size: 18px; margin: 0 0 4px; }}
+  input {{
+    font-size: 16px; padding: 12px 14px; border-radius: 10px;
+    border: 1px solid #3a3a3a; background: #121212; color: #e8e8e8;
+  }}
+  button {{
+    font-size: 16px; padding: 12px; border: none; border-radius: 10px;
+    background: #2d7dd2; color: #fff;
+  }}
+  button:active {{ background: #2568b0; }}
+  .err {{ color: #ff8a8a; font-size: 14px; }}
+</style>
+</head>
+<body>
+<form method="POST" action="/login">
+  <h1>🔒 ログイン</h1>
+  {error}
+  <input type="password" name="password" placeholder="パスワード"
+         autofocus autocomplete="current-password" inputmode="text">
+  <button type="submit">開く</button>
+</form>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RemoteGfxViewer/1.0"
 
@@ -420,6 +477,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         qs = urllib.parse.parse_qs(parsed.query)
+
+        # ---- 認証ゲート ----
+        if AUTH_ENABLED:
+            if path == "/login":
+                return self.serve_login()
+            if path == "/logout":
+                return self.handle_logout()
+            if not self.is_authed():
+                return self.redirect("/login")
 
         # ---- Eagle 連携ルート ----
         if path == "/eagle/thumb":
@@ -444,6 +510,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if AUTH_ENABLED and path == "/login":
+            return self.handle_login()
+        if AUTH_ENABLED and not self.is_authed():
+            return self._json_error(401, "認証が必要です")
         if path not in ("/eagle/star", "/eagle/trash"):
             self.send_error(404, "Not Found")
             return
@@ -463,6 +533,68 @@ class Handler(BaseHTTPRequestHandler):
         except (eagle.EagleError, ValueError) as e:
             return self._json_error(502, str(e))
         self._json_ok()
+
+    # ----------------------------------------------------------------- #
+    # 認証
+    # ----------------------------------------------------------------- #
+    def _cookie_token(self):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = http_cookies.SimpleCookie(raw)
+        except http_cookies.CookieError:
+            return None
+        m = jar.get("session")
+        return m.value if m else None
+
+    def is_authed(self):
+        if not AUTH_ENABLED:
+            return True
+        token = self._cookie_token()
+        return bool(token and token in SESSIONS)
+
+    def redirect(self, location, cookie=None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def serve_login(self, error=""):
+        err_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+        body = LOGIN_TEMPLATE.format(error=err_html).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_login(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b""
+            form = urllib.parse.parse_qs(raw.decode("utf-8"))
+        except (ValueError, OSError):
+            form = {}
+        pw = form.get("password", [""])[0]
+        if PASSWORD is not None and hmac.compare_digest(pw, PASSWORD):
+            token = secrets.token_urlsafe(32)
+            SESSIONS.add(token)
+            cookie = (
+                f"session={token}; HttpOnly; SameSite=Lax; Path=/; "
+                f"Max-Age={SESSION_MAX_AGE}"
+            )
+            return self.redirect("/", cookie=cookie)
+        # 失敗
+        self.serve_login(error="パスワードが違います")
+
+    def handle_logout(self):
+        token = self._cookie_token()
+        if token:
+            SESSIONS.discard(token)
+        self.redirect("/login", cookie="session=; Path=/; Max-Age=0")
 
     # ----------------------------------------------------------------- #
     def _read_json(self):
@@ -517,6 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             images_payload.append(entry)
         images_json = json.dumps(images_payload, ensure_ascii=False)
         edit_js = "true" if (EDIT_ENABLED and EAGLE_MODE) else "false"
+        logout_link = '<a class="logout" href="/logout">ログアウト</a>' if AUTH_ENABLED else ""
         page = PAGE_TEMPLATE.format(
             title=html.escape(title),
             crumbs=crumbs_html,
@@ -525,6 +658,7 @@ class Handler(BaseHTTPRequestHandler):
             grid_html=grid_html,
             images_json=images_json,
             edit_js=edit_js,
+            logout_link=logout_link,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -818,6 +952,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global ROOT_DIR, THUMB_SIZE, EAGLE_MODE, EAGLE_API, EDIT_ENABLED
+    global PASSWORD, AUTH_ENABLED
 
     parser = argparse.ArgumentParser(
         description="同じLAN上のスマホからローカル画像を閲覧する軽量サーバー"
@@ -857,12 +992,19 @@ def main():
         action="store_true",
         help="スマホからの★評価変更・削除（ゴミ箱へ）を許可する（--eagle 時のみ）",
     )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("RGV_PASSWORD"),
+        help="ログインパスワード（指定すると認証必須。環境変数 RGV_PASSWORD でも可）",
+    )
     args = parser.parse_args()
 
     EAGLE_MODE = args.eagle
     EAGLE_API = args.eagle_api
     EDIT_ENABLED = args.allow_edit
     THUMB_SIZE = args.thumb_size
+    PASSWORD = args.password if args.password else None
+    AUTH_ENABLED = PASSWORD is not None
 
     # ディレクトリ: 指定があれば検証。--eagle 単独なら省略可。
     root = None
@@ -896,7 +1038,11 @@ def main():
         print(f"  編集         : {edit_label}")
     if root:
         print(f"  公開フォルダ : {root}")
+    print(f"  認証         : {'有効（パスワード）' if AUTH_ENABLED else '無効（誰でもアクセス可）'}")
     print(f"  サムネイル   : {'Pillowで生成' if HAS_PIL else '元画像を縮小表示 (Pillow未導入)'}")
+    if EDIT_ENABLED and not AUTH_ENABLED:
+        print()
+        print("  ⚠️  編集が有効ですが認証がありません。出先公開時は必ず --password を設定してください。")
     print()
     print("  スマホのブラウザで以下を開いてください:")
     print(f"    http://{ip}:{args.port}/")
