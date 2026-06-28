@@ -202,26 +202,30 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     object-fit: contain; user-select: none; -webkit-user-drag: none;
   }}
   #lb .bar {{
-    position: absolute; top: 0; left: 0; right: 0;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 20;
     padding: 14px; padding-top: max(14px, env(safe-area-inset-top));
     display: flex; justify-content: space-between; align-items: center;
     background: linear-gradient(rgba(0,0,0,.55), transparent);
     font-size: 14px;
     transition: opacity .2s ease;
   }}
-  #lb .close {{
+  #lb .baractions {{ display: flex; gap: 10px; align-items: center; }}
+  #lb .iconbtn, #lb .close {{
     background: rgba(255,255,255,.15); border: none; color: #fff;
-    width: 38px; height: 38px; border-radius: 50%; font-size: 20px;
+    width: 38px; height: 38px; border-radius: 50%; font-size: 19px;
+    display: flex; align-items: center; justify-content: center;
+    text-decoration: none; cursor: pointer;
   }}
+  #lb .iconbtn:active, #lb .close:active {{ background: rgba(255,255,255,.3); }}
   #lb .nav {{
-    position: absolute; top: 0; bottom: 0; width: 33%;
+    position: absolute; top: 0; bottom: 0; width: 33%; z-index: 5;
     display: flex; align-items: center; opacity: 0;
   }}
   #lb .nav.prev {{ left: 0; justify-content: flex-start; }}
   #lb .nav.next {{ right: 0; justify-content: flex-end; }}
   #lb .pos {{ color: #ddd; }}
   #lb .toolbar {{
-    position: absolute; left: 0; right: 0; bottom: 0;
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 20;
     padding: 16px 14px; padding-bottom: max(16px, env(safe-area-inset-bottom));
     display: none; align-items: center; justify-content: space-between;
     background: linear-gradient(transparent, rgba(0,0,0,.65));
@@ -267,7 +271,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="stage"><img id="lbimg" alt=""></div>
   <div class="bar">
     <span class="pos" id="lbpos"></span>
-    <button class="close" id="lbclose" aria-label="閉じる">&times;</button>
+    <div class="baractions">
+      <button class="iconbtn" id="lbsave" aria-label="保存">⬇</button>
+      <button class="close" id="lbclose" aria-label="閉じる">&times;</button>
+    </div>
   </div>
   <div class="nav prev" id="lbprev"></div>
   <div class="nav next" id="lbnext"></div>
@@ -325,6 +332,26 @@ function show() {{
 }}
 // 画像中央のタップでコントロール表示/非表示をトグル
 function toggleChrome() {{ lb.classList.toggle('chrome'); }}
+
+// 画像を端末に保存（ダウンロード）
+async function download() {{
+  const it = IMAGES[idx];
+  if (!it) return;
+  const fname = (it.name || 'image').replace(/[\\\\/:*?"<>|]/g, '_');
+  try {{
+    const r = await fetch(it.full);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast('保存しました');
+  }} catch (e) {{
+    // フォールバック: 直接リンクを開く（端末側で長押し保存）
+    window.open(it.full, '_blank');
+  }}
+}}
 function next() {{ if (idx < IMAGES.length - 1) {{ idx++; show(); }} }}
 function prev() {{ if (idx > 0) {{ idx--; show(); }} }}
 
@@ -391,6 +418,7 @@ document.querySelectorAll('.cell').forEach((c) => {{
 document.getElementById('lbclose').addEventListener('click', close);
 document.getElementById('lbnext').addEventListener('click', next);
 document.getElementById('lbprev').addEventListener('click', prev);
+document.getElementById('lbsave').addEventListener('click', download);
 lbtrash.addEventListener('click', trash);
 // 画像（中央）のタップでコントロールを表示/非表示（スワイプ時は無視）
 document.querySelector('#lb .stage').addEventListener('click', () => {{
