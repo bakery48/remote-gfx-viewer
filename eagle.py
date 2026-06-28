@@ -192,12 +192,15 @@ def _set_match(method: str, target_set: set, values: list) -> bool:
     vals = {str(v).lower() for v in values}
     if not vals:
         return True
-    if method in ("contain", "include", "contains", "is", "equal"):
-        return bool(tset & vals)  # いずれか一致
-    if method in ("notContain", "exclude", "isNot"):
-        return not (tset & vals)
-    if method in ("containAll", "all"):
+    # Eagle のタグ条件:
+    #   intersection = 指定タグを「全部」含む (ALL)
+    #   union        = 指定タグの「いずれか」を含む (ANY)
+    #   difference   = いずれも含まない (NONE)
+    if method in ("intersection", "containAll", "all"):
         return vals <= tset
+    if method in ("notContain", "exclude", "isNot", "difference"):
+        return not (tset & vals)
+    # union / contain / include / is など → いずれか一致 (ANY)
     return bool(tset & vals)
 
 
