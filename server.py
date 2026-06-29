@@ -988,6 +988,7 @@ class Handler(BaseHTTPRequestHandler):
         for vid, icon, label in (
             ("__all__", "🗂️", "すべて"),
             ("__uncategorized__", "📭", "未分類"),
+            ("__no_smart_folder__", "🧩", "スマートフォルダ未該当"),
         ):
             href = "/eagle/smart?id=" + vid
             items_html.append(
@@ -1022,6 +1023,12 @@ class Handler(BaseHTTPRequestHandler):
             elif sid == "__uncategorized__":
                 target = {"name": "未分類", "partial": False}
                 matched = [it for it in items if not it.get("folders")]
+            elif sid == "__no_smart_folder__":
+                folders = eagle.get_smart_folders(EAGLE_API)
+                # 色・日付など丸ごと未対応のSFがあると精度が落ちるため partial 表示
+                partial = any(f["partial"] for f in folders)
+                target = {"name": "スマートフォルダ未該当", "partial": partial}
+                matched = eagle.filter_no_smart_folder(folders, items)
             else:
                 folders = eagle.get_smart_folders(EAGLE_API)
                 target = next((f for f in folders if f["id"] == sid), None)

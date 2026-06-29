@@ -293,3 +293,35 @@ def item_matches(conditions, item: dict) -> bool:
 
 def filter_items(conditions, items: list[dict]) -> list[dict]:
     return [it for it in items if item_matches(conditions, it)]
+
+
+# こちらで評価できるプロパティ（_eval_rule が扱うもの）
+SUPPORTED_PROPERTIES = {
+    "name", "title", "annotation", "note", "memo", "url", "link",
+    "ext", "extension", "type", "filetype", "tag", "tags", "folder", "folders",
+    "rating", "star", "stars", "width", "height", "size", "filesize",
+    "shape", "orientation",
+}
+
+
+def _conditions_evaluable(conditions) -> bool:
+    """少なくとも1つ、こちらで評価できるルールを含むか。"""
+    for group in conditions or []:
+        for rule in group.get("rules", []) or []:
+            if rule.get("property") in SUPPORTED_PROPERTIES:
+                return True
+    return False
+
+
+def filter_no_smart_folder(smart_folders: list[dict], items: list[dict]) -> list[dict]:
+    """どのスマートフォルダの条件にも該当しないアイテムを返す。
+
+    色・日付など丸ごと未対応のスマートフォルダ（評価できないもの）は、
+    全件該当扱いになって結果を潰してしまうため、判定対象から除外する。
+    """
+    conds = [
+        sf["conditions"]
+        for sf in smart_folders
+        if sf.get("conditions") and _conditions_evaluable(sf["conditions"])
+    ]
+    return [it for it in items if not any(item_matches(c, it) for c in conds)]
