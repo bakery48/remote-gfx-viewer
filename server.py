@@ -532,7 +532,9 @@ GENERATE_TEMPLATE = """<!DOCTYPE html>
     width: 100%; font-size: 16px; padding: 10px 12px; border-radius: 10px;
     border: 1px solid #3a3a3a; background: #1a1a1a; color: #e8e8e8;
   }}
-  textarea {{ resize: vertical; min-height: 70px; }}
+  textarea {{ resize: vertical; min-height: 70px; line-height: 1.5; }}
+  #prompt {{ min-height: 200px; }}
+  #negative {{ min-height: 110px; }}
   .row {{ display: flex; gap: 10px; }}
   .row > div {{ flex: 1; }}
   details {{ margin-top: 10px; background: #1a1a1a; border-radius: 10px; padding: 0 12px; }}
