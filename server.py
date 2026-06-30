@@ -1078,14 +1078,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         thumb_path = eagle.get_thumbnail_path(item_id, EAGLE_API)
         if not thumb_path:
+            self.log_message("eagle thumbnail path 取得失敗 id=%s", item_id)
             self.send_error(404, "Not Found")
             return
+
+        original = self._eagle_original_path(thumb_path)
         if thumb:
-            target = thumb_path
+            # サムネイル要求: _thumbnail.png があればそれ、無ければ原本。
+            candidates = [thumb_path, original]
         else:
-            # 原本は同じ .info フォルダ内。サムネイルが原本そのものの場合もある。
-            target = self._eagle_original_path(thumb_path)
-        self._serve_disk_file(target, require_info=True)
+            candidates = [original, thumb_path]
+        path = next((p for p in candidates if p and os.path.isfile(p)), None)
+        if path is None:
+            self.log_message(
+                "eagle 実ファイルが見つかりません id=%s thumb=%s path=%s",
+                item_id, thumb, thumb_path,
+            )
+            self.send_error(404, "Not Found")
+            return
+
+        # サムネイル要求かつ原寸しか無い場合は Pillow で縮小して軽くする
+        if thumb and self._try_send_thumbnail(path):
+            return
+        self._serve_disk_file(path, require_info=True)
 
     @staticmethod
     def _eagle_original_path(thumb_path: str) -> str:
@@ -1095,11 +1110,13 @@ class Handler(BaseHTTPRequestHandler):
         stem, ext = os.path.splitext(base)
         if stem.endswith("_thumbnail"):
             original_stem = stem[: -len("_thumbnail")]
-            # 同フォルダ内で原本（同名・拡張子違い）を探す
+            # 同フォルダ内で原本（同名・拡張子違い）を探す。metadata 以外で最初の1つ。
             try:
                 for f in os.listdir(d):
+                    if f == "metadata.json" or f.endswith("_thumbnail.png"):
+                        continue
                     fstem, _ = os.path.splitext(f)
-                    if fstem == original_stem and is_image(f):
+                    if fstem == original_stem:
                         return os.path.join(d, f)
             except OSError:
                 pass
@@ -1128,11 +1145,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_disk_file(self, abs_path, require_info=False):
-        """ディスク上の画像ファイルを配信する（Eagle 用）。"""
+        """ディスク上のファイルを配信する（Eagle 用）。
+
+        パスは Eagle API 由来（信頼できる）なので拡張子の許可リストでは弾かず、
+        .info フォルダ配下であることだけ確認する。未知拡張子はブラウザ側の
+        コンテンツ判定に任せる。
+        """
         if (
             not abs_path
             or not os.path.isfile(abs_path)
-            or not is_image(abs_path)
             or (require_info and ".info" not in abs_path)
         ):
             self.send_error(404, "Not Found")
@@ -1228,11 +1249,15 @@ class Handler(BaseHTTPRequestHandler):
         if abs_path is None or not os.path.isfile(abs_path) or not is_image(abs_path):
             self.send_error(404, "Not Found")
             return
+        if self._try_send_thumbnail(abs_path):
+            return
+        # Pillow が無い／生成失敗時は元画像をそのまま返す
+        self.serve_file(rel)
 
+    def _try_send_thumbnail(self, abs_path) -> bool:
+        """Pillow で縮小したサムネイルを送る。送れたら True、無理なら False。"""
         if not HAS_PIL:
-            # Pillow が無ければ元画像をそのまま返す（ブラウザ側で縮小表示）
-            return self.serve_file(rel)
-
+            return False
         try:
             with Image.open(abs_path) as im:
                 im.draft("RGB", (THUMB_SIZE, THUMB_SIZE))
@@ -1241,6 +1266,11 @@ class Handler(BaseHTTPRequestHandler):
                 buf = io.BytesIO()
                 im.save(buf, format="JPEG", quality=80)
                 data = buf.getvalue()
+        except (BrokenPipeError, ConnectionResetError):
+            return True  # 送信途中で切断: これ以上何もしない
+        except Exception:
+            return False
+        try:
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(data)))
@@ -1249,9 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception:
-            # サムネイル生成に失敗したら元画像で代替
-            self.serve_file(rel)
+        return True
 
     # ----------------------------------------------------------------- #
     def _copy(self, f):
