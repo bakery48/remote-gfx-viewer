@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# 生成プリセットの保存ファイル
+rgv_presets.json
+rgv_presets.json.tmp

@@ -39,6 +39,7 @@ from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import eagle
+import presets
 import sd
 
 # Pillow は任意。あればサムネイル生成に使う。
@@ -547,6 +548,17 @@ GENERATE_TEMPLATE = """<!DOCTYPE html>
   .results {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 16px; }}
   .results img {{ width: 100%; border-radius: 8px; display: block; }}
   .hint {{ color: #777; font-size: 12px; }}
+  .presets {{
+    display: flex; gap: 6px; align-items: center; margin-bottom: 6px;
+    background: #1a1a1a; border-radius: 10px; padding: 8px;
+  }}
+  .presets select {{ flex: 1; padding: 8px 10px; }}
+  .pbtn {{
+    border: none; border-radius: 8px; background: #333; color: #e8e8e8;
+    padding: 9px 10px; font-size: 13px; white-space: nowrap;
+  }}
+  .pbtn:active {{ background: #444; }}
+  .pbtn.def {{ background: #2d7dd2; color: #fff; }}
 </style>
 </head>
 <body>
@@ -555,6 +567,13 @@ GENERATE_TEMPLATE = """<!DOCTYPE html>
   <span>{header_links}</span>
 </header>
 <main>
+  <div class="presets">
+    <select id="slot"></select>
+    <button class="pbtn" id="loadBtn">読込</button>
+    <button class="pbtn" id="saveBtn">保存</button>
+    <button class="pbtn def" id="defBtn">既定に</button>
+  </div>
+
   <label>プロンプト</label>
   <textarea id="prompt" placeholder="例: a cat astronaut, highly detailed, cinematic lighting"></textarea>
 
@@ -599,6 +618,35 @@ let polling = null;
 
 function val(id) {{ return document.getElementById(id).value; }}
 
+// フォームの入力欄 ←→ 設定キー の対応
+const FIELDS = [
+  ['prompt', 'prompt', 's'], ['negative', 'negative_prompt', 's'],
+  ['width', 'width', 'n'], ['height', 'height', 'n'], ['count', 'n_iter', 'n'],
+  ['steps', 'steps', 'n'], ['cfg', 'cfg_scale', 'n'], ['seed', 'seed', 'n'],
+  ['sampler', 'sampler_name', 's'],
+];
+function getSettings() {{
+  const s = {{}};
+  for (const [id, key, t] of FIELDS) {{
+    const v = val(id);
+    s[key] = (t === 'n') ? (+v) : v;
+  }}
+  return s;
+}}
+function applySettings(s) {{
+  if (!s) return;
+  for (const [id, key] of FIELDS) {{
+    if (s[key] === undefined || s[key] === null) continue;
+    const el = document.getElementById(id);
+    if (el.tagName === 'SELECT') {{
+      // 候補に無いサンプラーは無視
+      if ([...el.options].some(o => o.value === String(s[key]))) el.value = s[key];
+    }} else {{
+      el.value = s[key];
+    }}
+  }}
+}}
+
 async function poll() {{
   try {{
     const r = await fetch('/sd/progress');
@@ -612,15 +660,7 @@ async function poll() {{
 
 async function generate() {{
   const save = EAGLE && document.getElementById('saveEagle') && document.getElementById('saveEagle').checked;
-  const body = {{
-    prompt: val('prompt'),
-    negative_prompt: val('negative'),
-    width: +val('width'), height: +val('height'),
-    n_iter: +val('count'),
-    steps: +val('steps'), cfg_scale: +val('cfg'),
-    seed: +val('seed'), sampler_name: val('sampler'),
-    save_to_eagle: !!save
-  }};
+  const body = Object.assign(getSettings(), {{ save_to_eagle: !!save }});
   btn.disabled = true;
   results.innerHTML = '';
   statusEl.textContent = '生成を開始しました...';
@@ -651,6 +691,74 @@ async function generate() {{
   }}
 }}
 btn.addEventListener('click', generate);
+
+// ---- プリセット（最大10個・既定設定）----
+const slotSel = document.getElementById('slot');
+let PRESETS = {{ default: null, slots: [] }};
+
+function renderSlots() {{
+  slotSel.innerHTML = '';
+  for (let i = 0; i < 10; i++) {{
+    const sl = PRESETS.slots[i];
+    const isDef = PRESETS.default === i;
+    const label = (i + 1) + ': ' + (sl ? sl.name : '（空）') + (isDef ? ' ★既定' : '');
+    const opt = document.createElement('option');
+    opt.value = i; opt.textContent = label;
+    slotSel.appendChild(opt);
+  }}
+}}
+function selectedSlot() {{ return +slotSel.value; }}
+
+async function loadPresets(applyDefault) {{
+  try {{
+    const r = await fetch('/sd/presets');
+    if (!r.ok) return;
+    PRESETS = await r.json();
+    renderSlots();
+    if (applyDefault && PRESETS.default !== null && PRESETS.slots[PRESETS.default]) {{
+      applySettings(PRESETS.slots[PRESETS.default].settings);
+      slotSel.value = PRESETS.default;
+    }}
+  }} catch (e) {{}}
+}}
+async function presetPost(path, body) {{
+  const r = await fetch(path, {{
+    method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body)
+  }});
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  PRESETS = d; renderSlots();
+}}
+
+document.getElementById('loadBtn').addEventListener('click', () => {{
+  const sl = PRESETS.slots[selectedSlot()];
+  if (!sl) {{ statusEl.textContent = 'そのスロットは空です'; return; }}
+  applySettings(sl.settings);
+  statusEl.textContent = '「' + sl.name + '」を読み込みました';
+}});
+document.getElementById('saveBtn').addEventListener('click', async () => {{
+  const i = selectedSlot();
+  const cur = PRESETS.slots[i];
+  const name = window.prompt('プリセット名', cur ? cur.name : ('スロット' + (i + 1)));
+  if (name === null) return;
+  try {{
+    await presetPost('/sd/presets/save', {{ slot: i, name: name, settings: getSettings() }});
+    slotSel.value = i;
+    statusEl.textContent = '保存しました: ' + (name || ('スロット' + (i + 1)));
+  }} catch (e) {{ statusEl.textContent = '保存失敗: ' + e.message; }}
+}});
+document.getElementById('defBtn').addEventListener('click', async () => {{
+  const i = selectedSlot();
+  if (!PRESETS.slots[i]) {{ statusEl.textContent = '空スロットは既定にできません'; return; }}
+  try {{
+    await presetPost('/sd/presets/default', {{ slot: i }});
+    slotSel.value = i;
+    statusEl.textContent = 'スロット' + (i + 1) + ' を既定にしました';
+  }} catch (e) {{ statusEl.textContent = '設定失敗: ' + e.message; }}
+}});
+
+loadPresets(true);
 </script>
 </body>
 </html>
@@ -683,6 +791,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.serve_generate_page()
         if SD_MODE and path == "/sd/progress":
             return self._send_json(sd.get_progress(SD_API))
+        if SD_MODE and path == "/sd/presets":
+            return self._send_json(presets.load())
         # ギャラリーが無く生成だけの構成なら / は生成画面へ
         if SD_MODE and path == "/" and not EAGLE_MODE and ROOT_DIR is None:
             return self.redirect("/generate")
@@ -716,6 +826,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_error(401, "認証が必要です")
         if path == "/generate/run":
             return self.handle_generate()
+        if path.startswith("/sd/presets/"):
+            return self.handle_presets(path)
         if path not in ("/eagle/star", "/eagle/trash"):
             self.send_error(404, "Not Found")
             return
@@ -839,6 +951,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_presets(self, path):
+        """生成設定プリセットの保存/削除/既定設定。"""
+        if not SD_MODE:
+            return self._json_error(403, "生成は無効です（--sd で起動してください）")
+        body = self._read_json()
+        if body is None:
+            return self._json_error(400, "不正なリクエストです")
+        try:
+            if path == "/sd/presets/save":
+                slot = body.get("slot")
+                data = presets.save_slot(
+                    int(slot), body.get("name", ""), body.get("settings", {})
+                )
+            elif path == "/sd/presets/delete":
+                data = presets.delete_slot(int(body.get("slot")))
+            elif path == "/sd/presets/default":
+                slot = body.get("slot")
+                data = presets.set_default(None if slot is None else int(slot))
+            else:
+                self.send_error(404, "Not Found")
+                return
+        except (ValueError, TypeError) as e:
+            return self._json_error(400, str(e))
+        except OSError as e:
+            return self._json_error(500, f"保存に失敗しました: {e}")
+        self._send_json(data)
 
     def handle_generate(self):
         if not SD_MODE:
@@ -1347,7 +1486,14 @@ def main():
         default=sd.DEFAULT_API,
         help=f"SD webui の API URL（既定: {sd.DEFAULT_API}）",
     )
+    parser.add_argument(
+        "--presets-file",
+        default="rgv_presets.json",
+        help="生成プリセットの保存先JSON（既定: rgv_presets.json）",
+    )
     args = parser.parse_args()
+
+    presets.configure(os.path.abspath(args.presets_file))
 
     EAGLE_MODE = args.eagle
     EAGLE_API = args.eagle_api
