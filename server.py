@@ -66,6 +66,7 @@ IMAGE_EXTENSIONS = {
 # 設定（main で上書きされる）
 ROOT_DIR = os.getcwd()
 THUMB_SIZE = 400  # サムネイルの最大辺(px)
+VIEW_SIZE = 2048  # 拡大表示プレビューの最大辺(px)。原寸は保存時のみ取得
 EAGLE_MODE = False  # Eagle 連携を有効にするか
 EAGLE_API = eagle.DEFAULT_API  # Eagle ローカル API のベースURL
 EDIT_ENABLED = False  # スマホからの編集（★/削除）を許可するか
@@ -321,6 +322,7 @@ function close() {{
 function show() {{
   if (idx < 0 || idx >= IMAGES.length) return;
   const it = IMAGES[idx];
+  lbimg.onerror = () => {{ toast('画像を読み込めませんでした'); }};
   lbimg.src = it.full;
   lbpos.textContent = (idx + 1) + ' / ' + IMAGES.length + '  ' + it.name;
   // 編集ツールバー（Eagleアイテム かつ --allow-edit のときのみ）
@@ -339,8 +341,9 @@ async function download() {{
   const it = IMAGES[idx];
   if (!it) return;
   const fname = (it.name || 'image').replace(/[\\\\/:*?"<>|]/g, '_');
+  const srcUrl = it.dl || it.full;  // 保存は原寸（dl）優先
   try {{
-    const r = await fetch(it.full);
+    const r = await fetch(srcUrl);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -350,7 +353,7 @@ async function download() {{
     toast('保存しました');
   }} catch (e) {{
     // フォールバック: 直接リンクを開く（端末側で長押し保存）
-    window.open(it.full, '_blank');
+    window.open(srcUrl, '_blank');
   }}
 }}
 function next() {{ if (idx < IMAGES.length - 1) {{ idx++; show(); }} }}
@@ -799,9 +802,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- Eagle 連携ルート ----
         if path == "/eagle/thumb":
-            return self.serve_eagle_image(qs.get("id", [""])[0], thumb=True)
+            return self.serve_eagle_image(qs.get("id", [""])[0], "thumb")
+        if path == "/eagle/view":
+            return self.serve_eagle_image(qs.get("id", [""])[0], "view")
         if path == "/eagle/raw":
-            return self.serve_eagle_image(qs.get("id", [""])[0], thumb=False)
+            return self.serve_eagle_image(qs.get("id", [""])[0], "raw")
         if path == "/eagle/smart":
             return self.serve_eagle_smart(qs.get("id", [""])[0])
         if EAGLE_MODE and path == "/":
@@ -1088,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
         images_payload = []
         for d in img_data:
             entry = {"name": d["name"], "full": d["full"]}
+            if "dl" in d:
+                entry["dl"] = d["dl"]
             if "id" in d:
                 entry["id"] = d["id"]
                 entry["star"] = d.get("star", 0)
@@ -1190,7 +1197,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "name": name,
                     "thumb": f"/eagle/thumb?id={iid}",
-                    "full": f"/eagle/raw?id={iid}",
+                    "full": f"/eagle/view?id={iid}",  # 拡大は軽量プレビュー
+                    "dl": f"/eagle/raw?id={iid}",      # 保存は原寸
                     "id": raw_id,
                     "star": it.get("star", 0) or 0,
                 }
@@ -1210,8 +1218,14 @@ class Handler(BaseHTTPRequestHandler):
         count = f"画像 {len(img_data)} 件{note}"
         self.render_page(target["name"], crumbs, count, "", img_data)
 
-    def serve_eagle_image(self, item_id: str, thumb: bool):
-        """Eagle ライブラリ内の実ファイル（サムネイル or 原本）を配信する。"""
+    def serve_eagle_image(self, item_id: str, kind: str):
+        """Eagle ライブラリ内の画像を配信する。
+
+        kind:
+          thumb … 一覧用サムネイル（最大 THUMB_SIZE に縮小）
+          view  … 拡大表示用プレビュー（最大 VIEW_SIZE に縮小。トンネル越しでも軽い）
+          raw   … 原寸そのまま（保存/ダウンロード用）
+        """
         if not item_id:
             self.send_error(404, "Not Found")
             return
@@ -1222,23 +1236,26 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         original = self._eagle_original_path(thumb_path)
-        if thumb:
+        if kind == "thumb":
             # サムネイル要求: _thumbnail.png があればそれ、無ければ原本。
             candidates = [thumb_path, original]
         else:
+            # view / raw は原本を優先（プレビューは原本から縮小、保存は原本）
             candidates = [original, thumb_path]
         path = next((p for p in candidates if p and os.path.isfile(p)), None)
         if path is None:
             self.log_message(
-                "eagle 実ファイルが見つかりません id=%s thumb=%s path=%s",
-                item_id, thumb, thumb_path,
+                "eagle 実ファイルが見つかりません id=%s kind=%s path=%s",
+                item_id, kind, thumb_path,
             )
             self.send_error(404, "Not Found")
             return
 
-        # サムネイル要求かつ原寸しか無い場合は Pillow で縮小して軽くする
-        if thumb and self._try_send_thumbnail(path):
+        if kind == "thumb" and self._try_send_scaled(path, THUMB_SIZE, 80):
             return
+        if kind == "view" and self._try_send_scaled(path, VIEW_SIZE, 85):
+            return
+        # raw、または Pillow が無い場合は原寸をそのまま配信
         self._serve_disk_file(path, require_info=True)
 
     @staticmethod
@@ -1388,22 +1405,22 @@ class Handler(BaseHTTPRequestHandler):
         if abs_path is None or not os.path.isfile(abs_path) or not is_image(abs_path):
             self.send_error(404, "Not Found")
             return
-        if self._try_send_thumbnail(abs_path):
+        if self._try_send_scaled(abs_path, THUMB_SIZE):
             return
         # Pillow が無い／生成失敗時は元画像をそのまま返す
         self.serve_file(rel)
 
-    def _try_send_thumbnail(self, abs_path) -> bool:
-        """Pillow で縮小したサムネイルを送る。送れたら True、無理なら False。"""
+    def _try_send_scaled(self, abs_path, max_size, quality=80) -> bool:
+        """Pillow で max_size 以下に縮小した JPEG を送る。送れたら True。"""
         if not HAS_PIL:
             return False
         try:
             with Image.open(abs_path) as im:
-                im.draft("RGB", (THUMB_SIZE, THUMB_SIZE))
+                im.draft("RGB", (max_size, max_size))
                 im = im.convert("RGB")
-                im.thumbnail((THUMB_SIZE, THUMB_SIZE))
+                im.thumbnail((max_size, max_size))
                 buf = io.BytesIO()
-                im.save(buf, format="JPEG", quality=80)
+                im.save(buf, format="JPEG", quality=quality)
                 data = buf.getvalue()
         except (BrokenPipeError, ConnectionResetError):
             return True  # 送信途中で切断: これ以上何もしない
