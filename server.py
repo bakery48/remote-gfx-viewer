@@ -1297,22 +1297,39 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _eagle_original_path(thumb_path: str) -> str:
-        """`<name>_thumbnail.png` を原本ファイルパスへ変換する。"""
+        """サムネイルのパスから原本ファイルのパスを推定する。
+
+        Eagle がサムネ名と原本名を別に付ける場合（生成画像など名前に記号が
+        入ると顕著）があるため、`.info` フォルダ内を走査して実画像を確実に拾う:
+          1) `<stem>_thumbnail.png` と同名の原本があればそれ
+          2) 無ければ metadata/サムネ以外で最初の画像ファイル
+        """
         d = os.path.dirname(thumb_path)
         base = os.path.basename(thumb_path)
-        stem, ext = os.path.splitext(base)
-        if stem.endswith("_thumbnail"):
-            original_stem = stem[: -len("_thumbnail")]
-            # 同フォルダ内で原本（同名・拡張子違い）を探す。metadata 以外で最初の1つ。
-            try:
-                for f in os.listdir(d):
-                    if f == "metadata.json" or f.endswith("_thumbnail.png"):
-                        continue
-                    fstem, _ = os.path.splitext(f)
-                    if fstem == original_stem:
-                        return os.path.join(d, f)
-            except OSError:
-                pass
+        stem, _ = os.path.splitext(base)
+        original_stem = (
+            stem[: -len("_thumbnail")] if stem.endswith("_thumbnail") else stem
+        )
+        try:
+            files = os.listdir(d)
+        except OSError:
+            return thumb_path
+
+        def is_candidate(f):
+            return (
+                f != "metadata.json"
+                and not f.endswith("_thumbnail.png")
+                and is_image(f)
+            )
+
+        candidates = [f for f in files if is_candidate(f)]
+        # 1) 名前一致を優先
+        for f in candidates:
+            if os.path.splitext(f)[0] == original_stem:
+                return os.path.join(d, f)
+        # 2) それ以外は最初の画像ファイル
+        if candidates:
+            return os.path.join(d, candidates[0])
         return thumb_path  # サムネイル＝原本のケース
 
     def send_eagle_error(self, err: Exception):
