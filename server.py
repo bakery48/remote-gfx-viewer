@@ -544,6 +544,12 @@ GENERATE_TEMPLATE = """<!DOCTYPE html>
     background: #2d7dd2; color: #fff; font-size: 17px; font-weight: 600;
   }}
   .gen:disabled {{ background: #444; }}
+  .stop {{
+    width: 100%; margin-top: 10px; padding: 14px; border: none; border-radius: 12px;
+    background: #c0392b; color: #fff; font-size: 16px; font-weight: 600; display: none;
+  }}
+  .stop:active {{ background: #a93226; }}
+  .stop.show {{ display: block; }}
   .check {{ display: flex; align-items: center; gap: 8px; margin-top: 14px; }}
   .check input {{ width: auto; }}
   #status {{ margin-top: 14px; font-size: 14px; color: #9ad; min-height: 20px; }}
@@ -607,6 +613,7 @@ GENERATE_TEMPLATE = """<!DOCTYPE html>
   {eagle_save_html}
 
   <button class="gen" id="genbtn">生成する</button>
+  <button class="stop" id="stopbtn">■ 生成を中止</button>
   <div id="status"></div>
   <div class="barwrap" id="barwrap"><div id="bar"></div></div>
   <div class="results" id="results"></div>
@@ -667,6 +674,7 @@ async function generate() {{
   const save = EAGLE && document.getElementById('saveEagle') && document.getElementById('saveEagle').checked;
   const body = Object.assign(getSettings(), {{ save_to_eagle: !!save }});
   btn.disabled = true;
+  stopBtn.classList.add('show');
   results.innerHTML = '';
   statusEl.textContent = '生成を開始しました...';
   barwrap.classList.add('show'); bar.style.width = '0%';
@@ -693,8 +701,24 @@ async function generate() {{
     bar.style.width = '100%';
     setTimeout(() => barwrap.classList.remove('show'), 600);
     btn.disabled = false;
+    stopBtn.classList.remove('show');
   }}
 }}
+
+const stopBtn = document.getElementById('stopbtn');
+stopBtn.addEventListener('click', async () => {{
+  stopBtn.disabled = true;
+  statusEl.textContent = '中止しています...';
+  try {{
+    const r = await fetch('/sd/interrupt', {{ method: 'POST' }});
+    if (!r.ok) {{ const d = await r.json().catch(() => ({{}})); throw new Error(d.error || ('HTTP ' + r.status)); }}
+    statusEl.textContent = '中止をリクエストしました';
+  }} catch (e) {{
+    statusEl.textContent = '中止に失敗: ' + e.message;
+  }} finally {{
+    stopBtn.disabled = false;
+  }}
+}});
 btn.addEventListener('click', generate);
 
 // ---- プリセット（最大10個・既定設定）----
@@ -833,6 +857,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_error(401, "認証が必要です")
         if path == "/generate/run":
             return self.handle_generate()
+        if path == "/sd/interrupt":
+            return self.handle_interrupt()
         if path.startswith("/sd/presets/"):
             return self.handle_presets(path)
         if path not in ("/eagle/star", "/eagle/trash"):
@@ -985,6 +1011,15 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             return self._json_error(500, f"保存に失敗しました: {e}")
         self._send_json(data)
+
+    def handle_interrupt(self):
+        if not SD_MODE:
+            return self._json_error(403, "生成は無効です（--sd で起動してください）")
+        try:
+            sd.interrupt(SD_API)
+        except sd.SDError as e:
+            return self._json_error(502, str(e))
+        self._json_ok()
 
     def handle_generate(self):
         if not SD_MODE:

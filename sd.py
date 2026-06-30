@@ -92,6 +92,11 @@ def get_progress(api_base: str = DEFAULT_API) -> dict:
         return {"progress": 0.0, "eta": 0.0}
 
 
+def interrupt(api_base: str = DEFAULT_API):
+    """実行中の生成を中断する（A1111 /sdapi/v1/interrupt）。"""
+    return _post(api_base, "/sdapi/v1/interrupt", {}, timeout=10.0)
+
+
 def txt2img(params: dict, api_base: str = DEFAULT_API) -> dict:
     """txt2img を実行し、{"images": [base64...], "info": {...}} を返す。"""
     payload = build_payload(params)
